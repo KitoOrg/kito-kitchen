@@ -47,6 +47,23 @@ fn stock(dir: &Path) {
         "parts/rust/concepts/money.md",
         "# Amounts are `Cents(i64)`\n\nSee `crates/money`.\n",
     );
+    // A script the kitchen carries, and a command the machine has.
+    write(
+        dir,
+        "tools/greet.sh",
+        "#!/bin/sh\necho \"hello $1, from the lane's $(basename \"$PWD\")\"\nls\n",
+    );
+    write(dir, "tools/greet.toml", "about = \"Says hello, and what is here\"\nscript = \"greet.sh\"\nargs = [\"{who}\"]\n\n[input]\ntype = \"object\"\nrequired = [\"who\"]\n");
+    write(
+        dir,
+        "tools/fail.toml",
+        "about = \"Ends badly\"\ncommand = \"sh\"\nargs = [\"-c\", \"echo no; exit 3\"]\n",
+    );
+    write(
+        dir,
+        "tools/slow.toml",
+        "about = \"Never ends\"\ncommand = \"sleep\"\nargs = [\"30\"]\ntimeout_secs = 1\n",
+    );
 }
 
 /// Runs the plugin as a server runs it: its directory in the environment.
@@ -188,6 +205,30 @@ fn a_server_says_which_repository_is_its_kitchen_and_what_each_one_gets() {
     assert_eq!(
         shop["recipes"],
         json!([{ "name": "release", "about": "How a release is made" }])
+    );
+    let tools: Vec<&str> = shop["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(tools, ["fail", "greet", "slow"]);
+    assert_eq!(shop["tools"][1]["input"]["required"], json!(["who"]));
+    // A tool is given with what it takes to run it: the script the kitchen carries.
+    let greet = answer(dir, "tool", "shop", json!({ "name": "greet" }));
+    assert_eq!(
+        (greet["script"]["name"].as_str(), greet["args"][0].as_str()),
+        (Some("greet.sh"), Some("{who}"))
+    );
+    assert!(greet["script"]["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("#!/bin/sh"));
+    assert!(
+        answer(dir, "tool", "shop", json!({ "name": "nope" }))["error"]
+            .as_str()
+            .unwrap()
+            .contains("it has fail, greet, slow")
     );
     let books = answer(dir, "kitchen", "books", json!({}));
     assert_eq!(books["parts"], json!([]));
@@ -530,6 +571,128 @@ fn a_team_s_kitchen_reaches_whoever_works_in_a_connected_directory() {
     let (_, listed) = kito(&desk, &mine, &["plugin", "list", "--json"], None);
     assert!(listed.contains("\"kitchen\""), "{listed}");
 
+    // The kitchen's tools run in the working copy of the lane the agent
+    // works in, with what it gave as one word, whatever is in it.
+    let (opened, said) = kito(
+        &desk,
+        &mine,
+        &[
+            "lane",
+            "open",
+            "alice",
+            "--intent",
+            "a cheaper price",
+            "--scope",
+            "shop.ts",
+        ],
+        None,
+    );
+    assert!(opened, "{said}");
+    assert!(
+        desk.join(".kito/lanes/1/work/shop.ts").is_file(),
+        "the lane's copy is here"
+    );
+    assert!(
+        told["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "greet"),
+        "{told}"
+    );
+    let ran = tool(
+        "run",
+        json!({ "name": "greet", "lane": "lane/1", "args": { "who": "ada; touch owned" } }),
+    );
+    assert_eq!(ran["exit_code"], 0, "{ran}");
+    let output = ran["output"].as_str().unwrap();
+    assert!(
+        output.starts_with("hello ada; touch owned, from the lane's work\n")
+            && output.contains("shop.ts"),
+        "{output}"
+    );
+    assert!(!desk.join(".kito/lanes/1/work/owned").exists());
+    assert!(
+        tool("run", json!({ "name": "greet", "lane": "lane/1" }))["error"]
+            .as_str()
+            .unwrap()
+            .contains("wants `who`")
+    );
+    assert!(tool(
+        "run",
+        json!({ "name": "greet", "lane": "lane/9", "args": { "who": "x" } })
+    )["error"]
+        .as_str()
+        .unwrap()
+        .contains("no working copy of the lane `lane/9`"));
+    assert!(tool("run", json!({ "name": "greet" }))["error"]
+        .as_str()
+        .unwrap()
+        .contains("the `lane` you work in"));
+    let failed = tool("run", json!({ "name": "fail", "lane": "1" }));
+    assert_eq!(
+        (failed["exit_code"].as_i64(), failed["output"].as_str()),
+        (Some(3), Some("no"))
+    );
+    let slow = tool("run", json!({ "name": "slow", "lane": "1" }));
+    assert!(
+        slow["stopped"]
+            .as_str()
+            .unwrap()
+            .contains("stopped after 1 s")
+            && slow["exit_code"].is_null(),
+        "{slow}"
+    );
+    // For a person, the same.
+    let (ran, said) = kito(
+        &desk,
+        &mine,
+        &["kitchen", "run", "greet", "--lane", "1", "who=bob"],
+        None,
+    );
+    assert!(
+        ran && said.starts_with("hello bob, from the lane's work"),
+        "{said}"
+    );
+    let (ran, said) = kito(
+        &desk,
+        &mine,
+        &["kitchen", "run", "fail", "--lane", "1"],
+        None,
+    );
+    assert!(!ran && said.contains("ended with code 3"), "{said}");
+
+    // When a session starts, an agent is told the kitchen after Kito's
+    // own rules, without asking.
+    let start = json!({ "hook_event_name": "SessionStart", "cwd": desk });
+    let (started, said) = kito(&desk, &mine, &["hook", "session-start"], Some(&start));
+    assert!(started, "{said}");
+    let context: Value =
+        serde_json::from_str(said.trim()).unwrap_or_else(|e| panic!("{e}: {said}"));
+    let context = context["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    let (rules, kitchen_says) = context
+        .split_once("From the plugin `kitchen`")
+        .unwrap_or_else(|| panic!("{context}"));
+    assert!(rules.contains("Work in a lane."), "{rules}");
+    assert!(
+        kitchen_says.contains(
+            "The kitchen of Shopworks: how the people you work for want work done on `shop`."
+        ),
+        "{kitchen_says}"
+    );
+    assert!(
+        kitchen_says.contains("Say what you ran")
+            && kitchen_says.contains("- money: Amounts are `Cents(i64)`"),
+        "{kitchen_says}"
+    );
+    assert!(
+        kitchen_says.contains("- release: How a release is made")
+            && kitchen_says.contains("- greet: Says hello"),
+        "{kitchen_says}"
+    );
+
     // What is integrated into the kitchen is the kitchen from then on.
     write(
         &kitchen,
@@ -544,6 +707,27 @@ fn a_team_s_kitchen_reaches_whoever_works_in_a_connected_directory() {
         .map(|one| one["name"].as_str().unwrap().to_owned())
         .collect();
     assert_eq!(names, ["money", "order"]);
+
+    // The server away, the kitchen is the one it last gave, and says so.
+    drop(serving);
+    let (shown, said) = kito(&desk, &mine, &["kitchen"], None);
+    assert!(shown, "{said}");
+    assert!(
+        said.contains("could not be reached: this is the kitchen as it gave it a moment ago"),
+        "{said}"
+    );
+    assert!(
+        said.contains("Say what you ran") && said.contains("order"),
+        "{said}"
+    );
+    let away = tool("concept", json!({ "name": "money" }));
+    assert!(
+        away["text"].as_str().unwrap().contains("Cents(i64)") && away["copy"].is_string(),
+        "{away}"
+    );
+    // What was never asked for is not there to give.
+    let (shown, said) = kito(&desk, &mine, &["kitchen", "concept", "order"], None);
+    assert!(!shown && said.contains("the server ("), "{said}");
 
     kito(&desk, &mine, &["daemon", "stop"], None);
     for repo in [&kitchen, &shop] {

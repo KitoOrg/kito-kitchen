@@ -10,7 +10,8 @@
 //!   kitchen and which parts each repository picks, and `kito-kitchen
 //!   answer` is what the server runs for a question from a client;
 //! - in a directory connected to the server, `kito kitchen …` shows it to
-//!   a person, and `kito-kitchen tool …` gives it to an agent.
+//!   a person, and `kito-kitchen tool …` gives it to an agent, who is
+//!   told the behaviour when a session starts (`kito-kitchen session`).
 
 mod client;
 mod kitchen;
@@ -40,6 +41,11 @@ fn main() -> ExitCode {
                     .map(|word| (*word).to_owned())
                     .collect::<Vec<_>>(),
             )
+        }
+        // What an agent is told when a session starts.
+        ["session"] => {
+            print!("{}", client::session());
+            Ok(())
         }
         // A tool of the plugin, for an agent.
         ["tool", name] => {

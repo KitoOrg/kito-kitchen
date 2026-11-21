@@ -5,6 +5,7 @@
 //! behaviour.md            how agents work here: always told
 //! concepts/<name>.md      what a word of the team means: looked up
 //! recipes/<name>.md       how something is done, step by step: looked up
+//! tools/<name>.toml       a command every agent has, and what it takes
 //! parts/<part>/…          the same, for the repositories that pick the part
 //! ```
 //!
@@ -38,6 +39,37 @@ pub struct Entry {
     pub file: PathBuf,
 }
 
+/// A tool as the kitchen writes it: `tools/<name>.toml`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ToolSpec {
+    /// What it does and when to use it, for the agent.
+    pub about: String,
+    /// The program to run, found as the person's machine finds programs
+    /// or in the lane's working copy; or else `script`.
+    pub command: String,
+    /// A file next to this one, which the kitchen carries: run instead of
+    /// a program the machine has.
+    pub script: Option<String>,
+    /// What it is given: each a word of its own, never a line for a
+    /// shell. `{name}` is what the agent gave under that name.
+    pub args: Vec<String>,
+    /// The JSON Schema of what the agent gives (an object).
+    pub input: Option<toml::Value>,
+    /// Seconds after which it is stopped (default 120).
+    pub timeout_secs: Option<u64>,
+}
+
+/// A tool of the kitchen: a command every agent of the team has.
+#[derive(Clone, Debug)]
+pub struct Tool {
+    pub name: String,
+    pub part: Option<String>,
+    /// Where its file is: its script is next to it.
+    pub dir: PathBuf,
+    pub spec: ToolSpec,
+}
+
 /// What one repository gets of a kitchen.
 #[derive(Debug, Default)]
 pub struct Kitchen {
@@ -49,6 +81,7 @@ pub struct Kitchen {
     pub behaviour: String,
     pub concepts: BTreeMap<String, Entry>,
     pub recipes: BTreeMap<String, Entry>,
+    pub tools: BTreeMap<String, Tool>,
     /// What is wrong with it, said to whoever checks it: none of it stops
     /// the rest from being given.
     pub problems: Vec<String>,
@@ -147,6 +180,79 @@ fn entries(
     }
 }
 
+/// The tools of one directory (`tools/<name>.toml`), added to `all`.
+fn tools(
+    from: &Path,
+    part: Option<&str>,
+    all: &mut BTreeMap<String, Tool>,
+    problems: &mut Vec<String>,
+) {
+    let dir = from.join("tools");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    files.sort();
+    for file in files
+        .iter()
+        .filter(|file| file.extension().and_then(|ext| ext.to_str()) == Some("toml"))
+    {
+        let name = file
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let shown = match part {
+            Some(part) => format!("parts/{part}/tools/{name}.toml"),
+            None => format!("tools/{name}.toml"),
+        };
+        if !is_name(&name) {
+            problems.push(format!(
+                "{shown}: `{name}` is not a name (small letters, digits, `-` and `_`)"
+            ));
+            continue;
+        }
+        let read = std::fs::read_to_string(file).map_err(|e| e.to_string());
+        let spec: ToolSpec =
+            match read.and_then(|text| toml::from_str(&text).map_err(|e| e.to_string())) {
+                Ok(spec) => spec,
+                Err(why) => {
+                    problems.push(format!(
+                        "{shown}: {}",
+                        why.lines().next().unwrap_or_default()
+                    ));
+                    continue;
+                }
+            };
+        // A script is a file of the kitchen next to the tool, and nothing else.
+        let script_fits = spec.script.as_deref().is_none_or(|script| {
+            !script.contains(['/', '\\']) && !script.starts_with('.') && dir.join(script).is_file()
+        });
+        let wrong = if spec.about.trim().is_empty() {
+            Some("it has no `about`: that is what tells an agent when to use it")
+        } else if spec.command.trim().is_empty() == spec.script.is_none() {
+            Some("it names a `command` or a `script`, one of the two")
+        } else if !script_fits {
+            Some("its `script` is not a file next to it")
+        } else {
+            None
+        };
+        match wrong {
+            Some(wrong) => problems.push(format!("{shown}: {wrong}")),
+            None => {
+                let tool = Tool {
+                    name: name.clone(),
+                    part: part.map(str::to_owned),
+                    dir: dir.clone(),
+                    spec,
+                };
+                all.insert(name, tool);
+            }
+        }
+    }
+}
+
 /// Reads what a repository that picked `picked` gets of the kitchen in
 /// `dir`. `Err`: the directory is no kitchen.
 pub fn load(dir: &Path, picked: &[String]) -> Result<Kitchen, String> {
@@ -187,6 +293,7 @@ pub fn load(dir: &Path, picked: &[String]) -> Result<Kitchen, String> {
         &mut kitchen.recipes,
         &mut kitchen.problems,
     );
+    tools(dir, None, &mut kitchen.tools, &mut kitchen.problems);
     for part in picked {
         let from = dir.join("parts").join(part);
         if !is_name(part) || !from.is_dir() {
@@ -220,6 +327,7 @@ pub fn load(dir: &Path, picked: &[String]) -> Result<Kitchen, String> {
             &mut kitchen.recipes,
             &mut kitchen.problems,
         );
+        tools(&from, Some(part), &mut kitchen.tools, &mut kitchen.problems);
         kitchen.parts.push(part.clone());
     }
     Ok(kitchen)
@@ -345,6 +453,46 @@ mod tests {
             ["add-a-crate", "release"]
         );
         assert!(!rust.concepts.contains_key("page"));
+
+        // Tools: a command the machine has, or a script the kitchen carries.
+        let test = "about = \"Runs the tests\"\ncommand = \"npm\"\nargs = [\"test\", \"--\", \"{filter}\"]\n";
+        write(dir, "tools/test.toml", test);
+        write(dir, "tools/lint.sh", "#!/bin/sh\necho ok\n");
+        write(
+            dir,
+            "tools/lint.toml",
+            "about = \"Checks the style\"\nscript = \"lint.sh\"\n",
+        );
+        write(
+            dir,
+            "tools/both.toml",
+            "about = \"x\"\ncommand = \"a\"\nscript = \"lint.sh\"\n",
+        );
+        write(
+            dir,
+            "tools/out.toml",
+            "about = \"x\"\nscript = \"../behaviour.md\"\n",
+        );
+        write(dir, "tools/mute.toml", "command = \"a\"\n");
+        let cargo =
+            "about = \"Runs the tests of the crate\"\ncommand = \"cargo\"\nargs = [\"test\"]\n";
+        write(dir, "parts/rust/tools/test.toml", cargo);
+        let with = load(dir, &["rust".to_owned()]).unwrap();
+        assert_eq!(with.tools.keys().collect::<Vec<_>>(), ["lint", "test"]);
+        let test = &with.tools["test"];
+        assert_eq!(
+            (test.spec.command.as_str(), test.part.as_deref()),
+            ("cargo", Some("rust"))
+        );
+        assert_eq!(with.tools["lint"].spec.script.as_deref(), Some("lint.sh"));
+        assert_eq!(
+            load(dir, &[]).unwrap().tools["test"].spec.args,
+            ["test", "--", "{filter}"]
+        );
+        assert_eq!(with.problems.len(), 3, "{:?}", with.problems);
+        for file in ["both", "out", "mute"] {
+            std::fs::remove_file(dir.join(format!("tools/{file}.toml"))).unwrap();
+        }
 
         // What is wrong is said, and the rest is given.
         write(dir, "concepts/Bad Name.md", "x\n");

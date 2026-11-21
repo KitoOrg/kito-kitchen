@@ -84,6 +84,22 @@ impl Server {
     }
 }
 
+/// What a tool takes, as a JSON Schema: what the kitchen wrote, or anything.
+fn input_of(tool: &kitchen::Tool) -> Value {
+    let written = tool
+        .spec
+        .input
+        .as_ref()
+        .and_then(|input| serde_json::to_value(input).ok());
+    written
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({ "type": "object" }))
+}
+
+fn tool_listed(tool: &kitchen::Tool) -> Value {
+    json!({ "name": tool.name, "about": tool.spec.about.trim(), "part": tool.part, "input": input_of(tool) })
+}
+
 fn listed(entries: &BTreeMap<String, kitchen::Entry>) -> Vec<Value> {
     entries.values().map(|entry| json!(entry)).collect()
 }
@@ -132,7 +148,43 @@ pub fn answer(question: &str, params: &Value) -> Result<Value, String> {
             "behaviour": kitchen.behaviour,
             "concepts": listed(&kitchen.concepts),
             "recipes": listed(&kitchen.recipes),
+            "tools": kitchen.tools.values().map(tool_listed).collect::<Vec<_>>(),
         }),
+        // A tool, with what it takes to run it where the agent works: the
+        // script, if the kitchen carries one.
+        "tool" => {
+            let name = params["name"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase();
+            match kitchen.tools.get(&name) {
+                Some(tool) => {
+                    let script = tool.spec.script.as_deref().map(|script| {
+                        let text =
+                            std::fs::read_to_string(tool.dir.join(script)).unwrap_or_default();
+                        json!({ "name": script, "text": text })
+                    });
+                    json!({
+                        "name": tool.name,
+                        "about": tool.spec.about.trim(),
+                        "command": tool.spec.command,
+                        "script": script,
+                        "args": tool.spec.args,
+                        "input": input_of(tool),
+                        "timeout_secs": tool.spec.timeout_secs,
+                    })
+                }
+                None => {
+                    let known: Vec<&str> = kitchen.tools.keys().map(String::as_str).collect();
+                    let known = match known.is_empty() {
+                        true => "it has none".to_owned(),
+                        false => format!("it has {}", known.join(", ")),
+                    };
+                    json!({ "error": format!("the kitchen has no tool `{name}`: {known}") })
+                }
+            }
+        }
         "concept" => one("concept", &kitchen.concepts),
         "recipe" => one("recipe", &kitchen.recipes),
         other => {
@@ -155,6 +207,23 @@ fn show(kitchen: &Kitchen) {
                 .unwrap_or_default();
             println!("  {:<20} {}{from}", entry.name, entry.about);
         }
+    }
+    println!(
+        "Tools: {}",
+        if kitchen.tools.is_empty() { "none" } else { "" }
+    );
+    for tool in kitchen.tools.values() {
+        let from = tool
+            .part
+            .as_deref()
+            .map(|part| format!("  [{part}]"))
+            .unwrap_or_default();
+        let runs = tool.spec.script.as_deref().unwrap_or(&tool.spec.command);
+        println!(
+            "  {:<20} {}  (runs {runs}){from}",
+            tool.name,
+            tool.spec.about.trim()
+        );
     }
 }
 

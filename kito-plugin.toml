@@ -1,5 +1,5 @@
 name = "kitchen"
-version = "0.1.0"
+version = "0.2.0"
 description = "A team's kitchen: the behaviour, concepts and recipes it shares to work on its repositories"
 api = 2
 # On a server: `server_admin` for `kito-server kitchen`. In the directories
@@ -12,7 +12,16 @@ about = "The team's kitchen: new <dir> | set <repository> | parts <repository> [
 
 [[command]]
 name = "kitchen"
-about = "How this team works: the kitchen, a concept <name>, a recipe <name>"
+about = "How this team works: the kitchen, concept <name>, recipe <name>, run <tool> --lane <lane>"
+
+[session]
+about = "The kitchen's behaviour, and what concepts, recipes and tools it has"
+
+[[tool]]
+name = "run"
+description = "Runs one of the tools this team gives every agent (the tool `kitchen` lists them, with what each takes), in the working copy of the lane you work in. Prefer it to your own command for what it does."
+input = { type = "object", properties = { name = { type = "string", description = "The tool, as `kitchen` lists it" }, lane = { type = "string", description = "The lane you work in, as open_lane gave it: lane/3" }, args = { type = "object", description = "What the tool takes, by name" } }, required = ["name", "lane"] }
+timeout_secs = 3600
 
 [[tool]]
 name = "kitchen"
