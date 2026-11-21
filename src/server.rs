@@ -173,6 +173,7 @@ pub fn answer(question: &str, params: &Value) -> Result<Value, String> {
                         "args": tool.spec.args,
                         "input": input_of(tool),
                         "timeout_secs": tool.spec.timeout_secs,
+                        "network": tool.spec.network,
                     })
                 }
                 None => {

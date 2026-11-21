@@ -58,6 +58,9 @@ pub struct ToolSpec {
     pub input: Option<toml::Value>,
     /// Seconds after which it is stopped (default 120).
     pub timeout_secs: Option<u64>,
+    /// It needs the network (to fetch what a build depends on). A tool
+    /// that does not say so opens no connection.
+    pub network: bool,
 }
 
 /// A tool of the kitchen: a command every agent of the team has.

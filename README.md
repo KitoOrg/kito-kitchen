@@ -52,6 +52,7 @@ parts/<part>/…          the same, for the repositories that pick the part
   # command = "npm"             # or a program the machine has
   args = ["{only}"]             # `{name}`: what the agent gave under that name
   timeout_secs = 600
+  # network = true              # it opens no connection unless it says so
 
   [input]                       # a JSON Schema of what it takes
   type = "object"
@@ -59,7 +60,9 @@ parts/<part>/…          the same, for the repositories that pick the part
   ```
 
   What an agent gives is one word of the command, whatever is in it: no
-  shell reads it.
+  shell reads it. A tool runs confined to the lane, as `kito lane run`
+  runs a command: it writes only in the lane's working copy, and reads
+  neither Kito's own data nor your keys.
 - **A part** (`parts/rust/`, `parts/web/`) is for the repositories that
   pick it. A repository gets the base and its parts; a part wins over
   the base where both have something of the same name.
@@ -110,11 +113,18 @@ what was never asked for is not there to give.
 
 ## What to know before a team uses it
 
-- **A kitchen's tool runs as you**, in the lane's working copy, and is
-  not confined. Whoever may change the kitchen may run commands on the
-  team's machines: give that role accordingly, and review changes to
-  `tools/` like code. `KITO_KITCHEN_NO_TOOLS=1` turns the tools off on a
-  machine. A kitchen's scripts are for a Unix shell.
+- **A kitchen's tool runs confined to the lane** where Kito can confine
+  a command (Linux 5.13 or later): it writes only there, reads nothing
+  of Kito's own or of your keys, and reaches the network only if the
+  kitchen says the tool needs it. It still reads the rest of your
+  machine, and runs as you: whoever may change the kitchen decides what
+  runs, so give that role accordingly and review changes to `tools/`
+  like code.
+- **Where Kito cannot confine a command** (macOS, Windows, an older
+  Linux) a tool is not run, and says so. `KITO_KITCHEN_UNCONFINED=1`
+  runs the kitchen's tools as yourself there, unconfined: your call, on
+  your machine. `KITO_KITCHEN_NO_TOOLS=1` turns them off altogether. A
+  kitchen's scripts are for a Unix shell.
 - Which repository is the kitchen and what each repository picks are
   kept by the plugin on the server (`plugins/kitchen/config.toml`), not
   in a repository: they have no history.

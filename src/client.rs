@@ -232,8 +232,29 @@ fn workdir_of(lane: &str) -> Result<PathBuf, String> {
     }
 }
 
+/// Stops a tool and everything it started.
+fn stop(child: &mut std::process::Child) {
+    // The tool is the head of a group of its own: the group goes.
+    #[cfg(unix)]
+    {
+        let group = format!("-{}", child.id());
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", "--", &group])
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Runs a tool of the kitchen in the working copy of a lane, and returns
 /// how it ended and the end of what it printed.
+///
+/// It runs as a command of the lane does (`kito lane run`): confined to
+/// the lane, it writes only in the working copy and reads neither Kito's
+/// own data nor the person's keys, and it reaches the network only if the
+/// kitchen says the tool needs it. Where Kito cannot confine a command,
+/// the tool is not run, unless the person said to run the kitchen's tools
+/// as themselves (`KITO_KITCHEN_UNCONFINED`).
 pub fn run(name: &str, lane: &str, given: &Value) -> Result<Value, String> {
     if said("KITO_KITCHEN_NO_TOOLS").is_some() {
         return Err(
@@ -241,18 +262,28 @@ pub fn run(name: &str, lane: &str, given: &Value) -> Result<Value, String> {
                 .to_owned(),
         );
     }
+    let unconfined = said("KITO_KITCHEN_UNCONFINED").is_some();
     let workdir = workdir_of(lane)?;
     let tool = ask("tool", json!({ "name": name }))?;
     let name = tool["name"].as_str().unwrap_or(name).to_owned();
+    let root =
+        PathBuf::from(said("KITO_REPO").ok_or("the repository is not known (no KITO_REPO)")?);
     let own = own_dir()
         .ok_or("the repository is not known (no KITO_REPO)")?
         .join("tools")
         .join(&name);
     std::fs::create_dir_all(&own).map_err(|e| format!("{}: {e}", own.display()))?;
     let program = match tool["script"]["name"].as_str() {
-        // A script the kitchen carries: written here as the server gave it.
+        // A script the kitchen carries: written here as the server gave
+        // it, in the lane's own temporary directory, which is the one
+        // place outside the working copy a confined command reads.
         Some(script) => {
-            let file = own.join(script);
+            let dir = match unconfined {
+                true => own.clone(),
+                false => workdir.parent().unwrap_or(&workdir).join("tmp"),
+            };
+            std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            let file = dir.join(format!("kitchen-{name}-{script}"));
             let text = tool["script"]["text"].as_str().unwrap_or_default();
             std::fs::write(&file, text).map_err(|e| format!("{}: {e}", file.display()))?;
             #[cfg(unix)]
@@ -279,26 +310,41 @@ pub fn run(name: &str, lane: &str, given: &Value) -> Result<Value, String> {
     {
         args.push(filled(arg, &given, &name)?);
     }
+    let mut command = match unconfined {
+        true => {
+            let mut command = std::process::Command::new(&program);
+            command.args(&args).current_dir(&workdir);
+            command
+        }
+        // As a command of the lane is run: Kito confines it.
+        false => {
+            let mut command = std::process::Command::new("kito");
+            command.arg("--repo").arg(&root).args(["lane", "run", lane]);
+            if tool["network"] != true {
+                command.arg("--no-network");
+            }
+            command.arg("--").arg(&program).args(&args);
+            command
+        }
+    };
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
     // What it prints goes to a file: a tool that prints much is not left
     // waiting for somebody to read, and one that is stopped leaves what
     // it had said.
     let printed = own.join("last-output");
     let out = std::fs::File::create(&printed).map_err(|e| format!("{}: {e}", printed.display()))?;
     let both = out.try_clone().map_err(|e| e.to_string())?;
-    let mut child = std::process::Command::new(&program)
-        .args(&args)
-        .current_dir(&workdir)
+    let mut child = command
         .env("KITO_LANE", lane)
         .env("KITO_KITCHEN_TOOL", &name)
         .stdin(std::process::Stdio::null())
         .stdout(out)
         .stderr(both)
         .spawn()
-        .map_err(|e| {
-            format!(
-                "the tool `{name}` of the kitchen could not be run ({}): {e}",
-                program.display()
-            )
+        .map_err(|e| match unconfined {
+            true => format!("the tool `{name}` of the kitchen could not be run ({}): {e}", program.display()),
+            false => format!("the tool `{name}` of the kitchen could not be run: `kito` is not on the PATH ({e})"),
         })?;
     let within = Duration::from_secs(
         tool["timeout_secs"]
@@ -312,25 +358,32 @@ pub fn run(name: &str, lane: &str, given: &Value) -> Result<Value, String> {
             Ok(Some(status)) => break (Some(status), false),
             Ok(None) if started.elapsed() < within => std::thread::sleep(Duration::from_millis(25)),
             _ => {
-                let _ = child.kill();
-                let _ = child.wait();
+                stop(&mut child);
                 break (None, true);
             }
         }
     };
     let bytes = std::fs::read(&printed).unwrap_or_default();
     let end = &bytes[bytes.len().saturating_sub(OUTPUT_AT_MOST)..];
+    let output = String::from_utf8_lossy(end).trim_end().to_owned();
     let mut answer = json!({
         "tool": name,
         "lane": lane,
         "exit_code": status.and_then(|status| status.code()),
-        "output": String::from_utf8_lossy(end).trim_end(),
+        "confined": !unconfined,
+        "output": output,
     });
     if timed_out {
         answer["stopped"] = format!("it was stopped after {} s", within.as_secs()).into();
     }
     if bytes.len() > OUTPUT_AT_MOST {
         answer["cut"] = "only the end of what it printed is here".into();
+    }
+    // Kito said it cannot confine a command on this machine: the tool did not run.
+    if !unconfined && output.contains("a command cannot be confined here") {
+        answer["not_run"] = "Kito cannot confine a command on this machine, so the kitchen's tool was not run. The \
+                             person may run the kitchen's tools as themselves, unconfined: KITO_KITCHEN_UNCONFINED=1."
+            .into();
     }
     Ok(answer)
 }

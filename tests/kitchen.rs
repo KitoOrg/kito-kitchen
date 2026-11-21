@@ -64,6 +64,9 @@ fn stock(dir: &Path) {
         "tools/slow.toml",
         "about = \"Never ends\"\ncommand = \"sleep\"\nargs = [\"30\"]\ntimeout_secs = 1\n",
     );
+    // One that tries to write next to the repository, and to read Kito's own files.
+    let escape = "echo x > {out}/escaped && echo wrote; cat {out}/.kito/remote.toml > /dev/null && echo read; echo over";
+    write(dir, "tools/escape.toml", &format!("about = \"Tries to leave the lane\"\ncommand = \"sh\"\nargs = [\"-c\", \"{escape}\"]\n"));
 }
 
 /// Runs the plugin as a server runs it: its directory in the environment.
@@ -212,8 +215,8 @@ fn a_server_says_which_repository_is_its_kitchen_and_what_each_one_gets() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(tools, ["fail", "greet", "slow"]);
-    assert_eq!(shop["tools"][1]["input"]["required"], json!(["who"]));
+    assert_eq!(tools, ["escape", "fail", "greet", "slow"]);
+    assert_eq!(shop["tools"][2]["input"]["required"], json!(["who"]));
     // A tool is given with what it takes to run it: the script the kitchen carries.
     let greet = answer(dir, "tool", "shop", json!({ "name": "greet" }));
     assert_eq!(
@@ -228,7 +231,7 @@ fn a_server_says_which_repository_is_its_kitchen_and_what_each_one_gets() {
         answer(dir, "tool", "shop", json!({ "name": "nope" }))["error"]
             .as_str()
             .unwrap()
-            .contains("it has fail, greet, slow")
+            .contains("it has escape, fail, greet, slow")
     );
     let books = answer(dir, "kitchen", "books", json!({}));
     assert_eq!(books["parts"], json!([]));
@@ -378,10 +381,22 @@ fn a_team_s_kitchen_reaches_whoever_works_in_a_connected_directory() {
         said.into_owned()
     };
     // `kito`, as one person on their machine, or as the server's own user.
+    // The plugin runs the kitchen's tools through `kito`, found as a
+    // person's shell finds it: on the PATH.
+    let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let unconfined = std::cell::Cell::new(false);
     let kito = |cwd: &Path, config: &Path, args: &[&str], input: Option<&Value>| {
-        let mut child = Command::new(exe("kito"))
+        let mut command = Command::new(exe("kito"));
+        if unconfined.get() {
+            command.env("KITO_KITCHEN_UNCONFINED", "1");
+        }
+        let mut child = command
             .args(args)
             .current_dir(cwd)
+            .env("PATH", &path)
             .env("KITOD_BIN", exe("kitod"))
             .env("KITO_NO_CLAUDE", "1")
             .env("KITO_AUTHOR", "ada")
@@ -643,6 +658,42 @@ fn a_team_s_kitchen_reaches_whoever_works_in_a_connected_directory() {
             && slow["exit_code"].is_null(),
         "{slow}"
     );
+
+    // A tool is confined to the lane it runs in, as a command of the lane
+    // is: it writes nothing outside it and reads nothing of Kito's own.
+    let out = desk.to_str().unwrap();
+    let confined = tool(
+        "run",
+        json!({ "name": "escape", "lane": "lane/1", "args": { "out": out } }),
+    );
+    if confined["not_run"].is_string() {
+        // A machine where Kito cannot confine a command: the tool is not run at all.
+        assert!(!desk.join("escaped").exists(), "{confined}");
+    } else {
+        assert_eq!(confined["confined"], true, "{confined}");
+        let said = confined["output"].as_str().unwrap();
+        assert!(
+            said.ends_with("over") && !said.contains("wrote") && !said.contains("read"),
+            "{said}"
+        );
+        assert!(
+            !desk.join("escaped").exists(),
+            "a tool of the kitchen wrote outside its lane"
+        );
+    }
+    // Unless the person says the kitchen's tools run as themselves.
+    unconfined.set(true);
+    let free = tool(
+        "run",
+        json!({ "name": "escape", "lane": "lane/1", "args": { "out": out } }),
+    );
+    unconfined.set(false);
+    assert_eq!(free["confined"], false, "{free}");
+    assert!(
+        free["output"].as_str().unwrap().contains("wrote") && desk.join("escaped").is_file(),
+        "{free}"
+    );
+    std::fs::remove_file(desk.join("escaped")).unwrap();
     // For a person, the same.
     let (ran, said) = kito(
         &desk,
