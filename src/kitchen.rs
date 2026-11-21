@@ -373,6 +373,14 @@ pub fn start(dir: &Path, name: &str) -> Result<Vec<PathBuf>, String> {
              integration. Once it is in, every agent of the team can ask for it.\n"
                 .to_owned(),
         ),
+        (
+            "instructions/all/team.md",
+            "# How this team works\n\nKito writes this into `CLAUDE.md` and `AGENTS.md` of every repository this \
+             kitchen is attached to (`kito-server repo set <repository> --kitchen <this repository>`), after its \
+             own rules. A file in `instructions/<assistant>/` is for that assistant only; a repository's own \
+             instruction of the same name wins (`kito instructions set`).\n"
+                .to_owned(),
+        ),
         ("parts/README.md", "A directory here is a part (`parts/rust/`): the same files as the kitchen has, for the repositories that pick it (`kito-server kitchen parts <repository> rust`).\n".to_owned()),
     ];
     let mut written = Vec::new();
@@ -529,7 +537,7 @@ mod tests {
     fn a_kitchen_to_start_from_is_a_kitchen() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("kitchen");
-        assert_eq!(start(&dir, "Shop \"works\"").unwrap().len(), 5);
+        assert_eq!(start(&dir, "Shop \"works\"").unwrap().len(), 6);
         let kitchen = load(&dir, &[]).unwrap();
         assert_eq!(kitchen.name, "Shop \"works\"");
         assert!(

@@ -295,7 +295,7 @@ fn a_server_says_which_repository_is_its_kitchen_and_what_each_one_gets() {
     // A kitchen to start from.
     let new = dir.join("starter");
     let (ok, said) = admin(&["kitchen", "new", new.to_str().unwrap(), "Our", "team"]);
-    assert!(ok && said.contains("5 files"), "{said}");
+    assert!(ok && said.contains("6 files"), "{said}");
     assert!(std::fs::read_to_string(new.join("kitchen.toml"))
         .unwrap()
         .contains("name = \"Our team\""));

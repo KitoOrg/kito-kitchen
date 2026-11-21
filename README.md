@@ -34,6 +34,8 @@ behaviour.md            how agents work here: always told
 concepts/<name>.md      what a word of the team means: looked up
 recipes/<name>.md       how something is done, step by step: looked up
 tools/<name>.toml       a command every agent has, and what it takes
+instructions/all/<name>.md         what every assistant is told, in its own file
+instructions/<assistant>/<name>.md the same, for one assistant: claude, codex, zcode
 parts/<part>/…          the same, for the repositories that pick the part
 ```
 
@@ -67,10 +69,19 @@ parts/<part>/…          the same, for the repositories that pick the part
   pick it. A repository gets the base and its parts; a part wins over
   the base where both have something of the same name.
 
+- **Instructions** are Kito's standard for what assistants are told. A
+  repository the kitchen is attached to (`kito-server repo set <repository>
+  --kitchen <kitchen>`) has them written by Kito into `CLAUDE.md` and
+  `AGENTS.md`, after Kito's rules and before the repository's own, which
+  win where both have a file of the same name (`kito instructions`). Those
+  files are not part of the repository: Kito keeps them out of its history
+  and of git, and writes them again at every session.
+
 It is changed like code: a lane in the kitchen's repository, a review,
 an integration. What its main lane has is the kitchen, from then on, for
-everybody. Nothing is copied into `CLAUDE.md` or `AGENTS.md`, so nothing
-goes stale there.
+everybody. Behaviour, concepts and recipes are asked of the kitchen by the
+agents, and instructions are written again at each session, so nothing
+goes stale.
 
 ## Setting it up
 

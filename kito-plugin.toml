@@ -1,5 +1,5 @@
 name = "kitchen"
-version = "0.3.0"
+version = "0.4.0"
 description = "A team's kitchen: the behaviour, concepts and recipes it shares to work on its repositories"
 api = 2
 # On a server: `server_admin` for `kito-server kitchen`. In the directories
