@@ -457,7 +457,7 @@ fn a_team_s_kitchen_reaches_whoever_works_in_a_connected_directory() {
     );
     assert!(ok(&["kitchen", "set", "kitchen"]).contains("Shopworks"));
     ok(&["kitchen", "parts", "shop", "rust"]);
-    let token = ok(&["user", "add", "ada", "--role", "write"]);
+    let token = ok(&["user", "add", "ada", "--repo", "shop:write"]);
     let token = token
         .lines()
         .find(|line| line.starts_with("kito_"))
