@@ -1,0 +1,30 @@
+name = "kitchen"
+version = "0.1.0"
+description = "A team's kitchen: the behaviour, concepts and recipes it shares to work on its repositories"
+api = 2
+# On a server: `server_admin` for `kito-server kitchen`. In the directories
+# connected to it (`--for-clients`): `read`, to ask the server's kitchen.
+permissions = ["read", "server_admin"]
+
+[[server_command]]
+name = "kitchen"
+about = "The team's kitchen: new <dir> | set <repository> | parts <repository> [part…] | show [repository] | check"
+
+[[command]]
+name = "kitchen"
+about = "How this team works: the kitchen, a concept <name>, a recipe <name>"
+
+[[tool]]
+name = "kitchen"
+description = "How this team wants work done on its repositories: its behaviour (follow it), and the names of the concepts and recipes it has written down. Call it once, before your first change in a task."
+input = { type = "object", properties = {} }
+
+[[tool]]
+name = "concept"
+description = "What a word of this team means, as the team wrote it down. Call it when the task or the code uses one of the concepts the tool `kitchen` listed."
+input = { type = "object", properties = { name = { type = "string", description = "The name of the concept, as `kitchen` lists it" } }, required = ["name"] }
+
+[[tool]]
+name = "recipe"
+description = "How this team does something, step by step. Call it before doing one of the things the tool `kitchen` listed a recipe for, and follow the steps."
+input = { type = "object", properties = { name = { type = "string", description = "The name of the recipe, as `kitchen` lists it" } }, required = ["name"] }
