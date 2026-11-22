@@ -12,8 +12,14 @@
 //! - in a directory connected to the server, `kito kitchen …` shows it to
 //!   a person, and `kito-kitchen tool …` gives it to an agent, who is
 //!   told the behaviour when a session starts (`kito-kitchen session`).
+//!
+//! A repository gets the kitchen its own configuration names, or else the
+//! server's. A kitchen with nothing in it yet is drafted in its own
+//! repository by the assistant of whoever maintains it, as an interview
+//! (the tool `draft`).
 
 mod client;
+mod draft;
 mod kitchen;
 mod server;
 

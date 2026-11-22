@@ -1,11 +1,12 @@
 //! A kitchen as it is kept: a directory of files.
 //!
 //! ```text
-//! kitchen.toml            what the kitchen is called
+//! kitchen.toml            what the kitchen is called, and the repositories it is for
 //! behaviour.md            how agents work here: always told
 //! concepts/<name>.md      what a word of the team means: looked up
 //! recipes/<name>.md       how something is done, step by step: looked up
 //! tools/<name>.toml       a command every agent has, and what it takes
+//! instructions/<folder>/<name>.md  what assistants are told: written by Kito into the files they read
 //! parts/<part>/…          the same, for the repositories that pick the part
 //! ```
 //!
@@ -24,6 +25,9 @@ const ABOUT_AT_MOST: usize = 160;
 struct Manifest {
     name: String,
     about: String,
+    /// The repositories it was made for: `for = ["shop", "books"]`.
+    #[serde(rename = "for")]
+    made_for: Option<toml::Value>,
 }
 
 /// A concept or a recipe: its name, the line that says what it is about,
@@ -78,6 +82,9 @@ pub struct Tool {
 pub struct Kitchen {
     pub name: String,
     pub about: String,
+    /// The repositories it was made for, as it says them. Which kitchen a
+    /// repository gets is not said here: the server says it.
+    pub made_for: Vec<String>,
     /// The parts it was put together from, after the base.
     pub parts: Vec<String>,
     /// How agents work here: the base's, then each part's under its name.
@@ -123,6 +130,70 @@ pub fn parts_of(dir: &Path) -> Vec<String> {
         .collect();
     parts.sort();
     parts
+}
+
+/// The instructions kept in `dir`, in the layout Kito has for them
+/// (`<folder>/<file>.md`: the folder `all` for every assistant, or the name
+/// of one): the name of each (`all/style.md`) and its file, those for
+/// every assistant first. A link is not one: it is not followed.
+pub fn instructions_in(dir: &Path) -> Vec<(String, PathBuf)> {
+    // Small letters, digits, `-` and `_`; a file's name has dots too.
+    let fits = |name: &str, dots: bool| {
+        let plain = |c: char| {
+            c.is_ascii_lowercase()
+                || c.is_ascii_digit()
+                || c == '-'
+                || c == '_'
+                || (dots && c == '.')
+        };
+        !name.is_empty() && !name.starts_with('.') && name.chars().all(plain)
+    };
+    // The directories of a directory, or its files, by name.
+    let listed = |dir: &Path, dirs: bool| {
+        let entries = std::fs::read_dir(dir).into_iter().flatten().flatten();
+        let of_kind =
+            move |kind: std::fs::FileType| if dirs { kind.is_dir() } else { kind.is_file() };
+        entries
+            .filter(move |entry| entry.file_type().is_ok_and(of_kind))
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+    };
+    let mut found = Vec::new();
+    for folder in listed(dir, true).filter(|folder| fits(folder, false)) {
+        let files = listed(&dir.join(&folder), false);
+        for file in files.filter(|file| {
+            file.strip_suffix(".md")
+                .is_some_and(|stem| fits(stem, true))
+        }) {
+            found.push((format!("{folder}/{file}"), dir.join(&folder).join(&file)));
+        }
+    }
+    found.sort_by(|(a, _), (b, _)| (!a.starts_with("all/"), a).cmp(&(!b.starts_with("all/"), b)));
+    found
+}
+
+/// The names of the instructions a kitchen has (`all/style.md`): those of
+/// its `instructions/` that say something.
+pub fn instructions_of(dir: &Path) -> Vec<String> {
+    let says =
+        |file: &PathBuf| std::fs::read_to_string(file).is_ok_and(|text| !text.trim().is_empty());
+    let found = instructions_in(&dir.join("instructions")).into_iter();
+    found
+        .filter(|(_, file)| says(file))
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// `true` when the kitchen in `dir` has nothing in it yet: no behaviour,
+/// no concept, no recipe, no tool and no instruction, in its base or in
+/// one of its parts.
+pub fn holds_nothing(dir: &Path) -> bool {
+    load(dir, &parts_of(dir)).is_ok_and(|all| {
+        all.behaviour.is_empty()
+            && all.concepts.is_empty()
+            && all.recipes.is_empty()
+            && all.tools.is_empty()
+            && instructions_of(dir).is_empty()
+    })
 }
 
 /// The concepts or the recipes of one directory (`concepts`, `recipes`),
@@ -274,6 +345,25 @@ pub fn load(dir: &Path, picked: &[String]) -> Result<Kitchen, String> {
             .problems
             .push("kitchen.toml: it has no `name`".to_owned());
         kitchen.name = "the team".to_owned();
+    }
+    // Written wrong, it is said and the kitchen is given all the same.
+    let names = match &manifest.made_for {
+        None => Some(Vec::new()),
+        Some(toml::Value::Array(names)) => names.iter().map(toml::Value::as_str).collect(),
+        Some(_) => None,
+    };
+    match names {
+        Some(names) => {
+            for name in names.into_iter().map(str::trim) {
+                if !name.is_empty() && !kitchen.made_for.iter().any(|known| known == name) {
+                    kitchen.made_for.push(name.to_owned());
+                }
+            }
+        }
+        None => kitchen.problems.push(
+            "kitchen.toml: `for` is the list of the repositories it is for: for = [\"shop\", \"books\"]"
+                .to_owned(),
+        ),
     }
     let behaviour = |from: &Path| {
         std::fs::read_to_string(from.join("behaviour.md"))
@@ -521,6 +611,58 @@ mod tests {
     }
 
     #[test]
+    fn a_kitchen_says_which_repositories_it_is_for_and_whether_it_holds_anything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let said = "name = \"Shopworks\"\nfor = [\"shop\", \" books \", \"shop\", \"\"]\n";
+        write(dir, "kitchen.toml", said);
+        let kitchen = load(dir, &[]).unwrap();
+        assert_eq!(kitchen.made_for, ["shop", "books"]);
+        assert!(kitchen.problems.is_empty() && holds_nothing(dir));
+
+        // What is no instruction is none: a file that says nothing, a name Kito does not read.
+        write(dir, "instructions/all/empty.md", "\n");
+        write(dir, "instructions/all/notes.txt", "x\n");
+        write(dir, "instructions/Claude/x.md", "x\n");
+        write(dir, "parts/README.md", "A directory here is a part.\n");
+        assert!(instructions_of(dir).is_empty() && holds_nothing(dir));
+        write(dir, "instructions/claude/tests.md", "Run them.\n");
+        write(dir, "instructions/all/v1.2.md", "Old.\n");
+        write(dir, "instructions/all/style.md", "Tabs.\n");
+        assert_eq!(
+            instructions_of(dir),
+            ["all/style.md", "all/v1.2.md", "claude/tests.md"]
+        );
+        assert!(!holds_nothing(dir));
+
+        // What a part has, the kitchen has.
+        std::fs::remove_dir_all(dir.join("instructions")).unwrap();
+        assert!(holds_nothing(dir));
+        write(
+            dir,
+            "parts/rust/concepts/money.md",
+            "# Amounts are `Cents(i64)`\n",
+        );
+        assert!(!holds_nothing(dir) && load(dir, &[]).unwrap().concepts.is_empty());
+
+        // Written wrong, `for` is said, and the kitchen is given all the same.
+        write(
+            dir,
+            "kitchen.toml",
+            "name = \"Shopworks\"\nfor = \"shop\"\n",
+        );
+        let odd = load(dir, &[]).unwrap();
+        assert_eq!((odd.name.as_str(), odd.made_for.len()), ("Shopworks", 0));
+        assert!(
+            odd.problems[0].contains("`for` is the list of the repositories it is for"),
+            "{:?}",
+            odd.problems
+        );
+        // What is no kitchen is not one with nothing in it.
+        assert!(!holds_nothing(&dir.join("parts")));
+    }
+
+    #[test]
     fn names_are_what_goes_in_a_file_s_name_and_nowhere_else() {
         assert!(is_name("money") && is_name("add-a-crate") && is_name("v2_api"));
         for bad in ["", "../etc", "a/b", "Money", "-x", "a b", "a.md"] {
@@ -545,6 +687,10 @@ mod tests {
                 && kitchen.concepts.len() == 1
                 && kitchen.recipes.len() == 1
         );
+        // It says for no repository that it is made for it, and what it
+        // starts with is what it has: it is not one with nothing in it.
+        assert!(kitchen.made_for.is_empty() && !holds_nothing(&dir));
+        assert_eq!(instructions_of(&dir), ["all/team.md"]);
         assert!(start(&dir, "again").unwrap_err().contains("is not empty"));
     }
 }

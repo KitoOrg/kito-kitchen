@@ -69,11 +69,13 @@ fn stock(dir: &Path) {
     write(dir, "tools/escape.toml", &format!("about = \"Tries to leave the lane\"\ncommand = \"sh\"\nargs = [\"-c\", \"{escape}\"]\n"));
 }
 
-/// Runs the plugin as a server runs it: its directory in the environment.
+/// Runs the plugin as a server runs it: its directory in the environment,
+/// and for a question from a client, the repository asked from and what
+/// whoever asks may do in it.
 fn on_server(
     dir: &Path,
     args: &[&str],
-    asked_repo: Option<&str>,
+    asked: Option<(&str, &str)>,
     input: Option<&Value>,
 ) -> (bool, String) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kito-kitchen"));
@@ -82,11 +84,11 @@ fn on_server(
         .env("KITO_SERVER_DIR", dir)
         .env_remove("KITO_SOCKET")
         .env_remove("KITO_PLUGIN_KEY");
-    if let Some(repo) = asked_repo {
+    if let Some((repo, role)) = asked {
         command
             .env("KITO_ASKED_REPO", repo)
             .env("KITO_ASKED_BY", "ada")
-            .env("KITO_ASKED_ROLE", "write");
+            .env("KITO_ASKED_ROLE", role);
     }
     let mut child = command
         .stdin(Stdio::piped())
@@ -110,11 +112,17 @@ fn on_server(
     )
 }
 
-fn answer(dir: &Path, question: &str, repo: &str, params: Value) -> Value {
-    let (ok, said) = on_server(dir, &["answer", question], Some(repo), Some(&params));
+/// What somebody who may `role` in `repo` is answered from there.
+fn answer_as(dir: &Path, question: &str, repo: &str, role: &str, params: Value) -> Value {
+    let asked = Some((repo, role));
+    let (ok, said) = on_server(dir, &["answer", question], asked, Some(&params));
     assert!(ok, "{said}");
     serde_json::from_str(said.lines().last().unwrap_or_default())
         .unwrap_or_else(|e| panic!("{e}: {said}"))
+}
+
+fn answer(dir: &Path, question: &str, repo: &str, params: Value) -> Value {
+    answer_as(dir, question, repo, "write", params)
 }
 
 #[test]
@@ -180,6 +188,7 @@ fn a_server_says_which_repository_is_its_kitchen_and_what_each_one_gets() {
         ok && said.contains("Parts: rust") && said.contains("shop picked rust"),
         "{said}"
     );
+    assert_eq!(gets(&said, "books"), "`kitchen` (Shopworks): the server's");
     let (ok, said) = admin(&["kitchen", "show", "shop"]);
     assert!(
         ok && said.contains("the base and rust")
@@ -299,6 +308,617 @@ fn a_server_says_which_repository_is_its_kitchen_and_what_each_one_gets() {
     assert!(std::fs::read_to_string(new.join("kitchen.toml"))
         .unwrap()
         .contains("name = \"Our team\""));
+}
+
+/// Writes in a repository's own configuration which kitchen it names, as
+/// Kito does (`kito-server repo set <repository> --kitchen`).
+fn names(dir: &Path, repo: &str, path: &str) {
+    let config = format!("[main]\nprotected = true\n\n[kitchen]\npath = '{path}'\n");
+    write(&dir.join("repos").join(repo), ".kito/config.toml", &config);
+}
+
+/// What the server says a repository gets, in `Which kitchen each
+/// repository gets`.
+fn gets(said: &str, repo: &str) -> String {
+    let (_, listed) = said
+        .split_once("Which kitchen each repository gets:\n")
+        .unwrap_or_else(|| panic!("{said}"));
+    let line = listed
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some(repo))
+        .unwrap_or_else(|| panic!("{said}"));
+    line.trim().strip_prefix(repo).unwrap().trim().to_owned()
+}
+
+#[test]
+fn a_repository_gets_the_kitchen_it_names_and_else_the_server_s() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    for repo in ["kitchen", "pantry", "bare", "shop", "books", "notes"] {
+        std::fs::create_dir_all(dir.join("repos").join(repo).join(".kito")).unwrap();
+    }
+    let admin = |args: &[&str]| on_server(dir, args, None, None);
+    let kitchen_of = |repo: &str| answer(dir, "kitchen", repo, json!({}));
+    stock(&dir.join("repos/kitchen"));
+    let pantry = dir.join("repos/pantry");
+    write(
+        &pantry,
+        "kitchen.toml",
+        "name = \"Pantry\"\nabout = \"How the shop is worked on.\"\nfor = [\"shop\", \"gone\"]\n",
+    );
+    write(&pantry, "behaviour.md", "Ask before you delete.\n");
+    write(
+        &pantry,
+        "parts/web/concepts/page.md",
+        "# A page is a route\n",
+    );
+
+    // With no kitchen for the whole server, a repository has the one its
+    // own configuration names, and the others have none.
+    names(dir, "shop", "../pantry");
+    let shop = kitchen_of("shop");
+    assert_eq!(
+        (shop["kitchen"].as_str(), shop["behaviour"].as_str()),
+        (Some("Pantry"), Some("Ask before you delete."))
+    );
+    assert!(
+        shop.get("own").is_none() && shop.get("empty").is_none(),
+        "{shop}"
+    );
+    let none = kitchen_of("books");
+    assert!(
+        none["error"]
+            .as_str()
+            .unwrap()
+            .contains("this server has no kitchen"),
+        "{none}"
+    );
+    let (ok, said) = admin(&["kitchen", "show"]);
+    assert!(
+        ok && said.contains("No kitchen for the whole server"),
+        "{said}"
+    );
+    assert_eq!(gets(&said, "shop"), "`pantry` (Pantry): its own setting");
+    assert_eq!(gets(&said, "books"), "none");
+
+    // Else it has the server's.
+    assert!(admin(&["kitchen", "set", "kitchen"]).0);
+    assert_eq!(kitchen_of("books")["kitchen"], "Shopworks");
+    assert_eq!(kitchen_of("shop")["kitchen"], "Pantry");
+    // What it names is a repository of this server, whatever way the path
+    // takes to it; anything else is not its kitchen.
+    for path in ["../pantry/", "./../pantry", pantry.to_str().unwrap()] {
+        names(dir, "books", path);
+        assert_eq!(kitchen_of("books")["kitchen"], "Pantry", "{path}");
+    }
+    for path in ["../nowhere", "/nowhere/else", "..", "../pantry/parts", ""] {
+        names(dir, "books", path);
+        assert_eq!(kitchen_of("books")["kitchen"], "Shopworks", "{path}");
+    }
+
+    // A kitchen asked about itself gets itself, whatever it names and
+    // whichever the server's is.
+    names(dir, "pantry", "../kitchen");
+    let own = kitchen_of("pantry");
+    assert_eq!(
+        (
+            own["kitchen"].as_str(),
+            own["own"].as_bool(),
+            own.get("empty")
+        ),
+        (Some("Pantry"), Some(true), None)
+    );
+    let own = kitchen_of("kitchen");
+    assert_eq!(
+        (own["kitchen"].as_str(), own["own"].as_bool()),
+        (Some("Shopworks"), Some(true))
+    );
+    // One with nothing in it yet says so, to whoever gets it.
+    let bare = dir.join("repos/bare");
+    write(&bare, "kitchen.toml", "name = \"Bare\"\n");
+    let own = kitchen_of("bare");
+    assert_eq!(
+        (own["own"].as_bool(), own["empty"].as_bool()),
+        (Some(true), Some(true))
+    );
+    names(dir, "notes", "../bare");
+    let notes = kitchen_of("notes");
+    assert_eq!(
+        (
+            notes["kitchen"].as_str(),
+            notes.get("own"),
+            notes["empty"].as_bool()
+        ),
+        (Some("Bare"), None, Some(true))
+    );
+    write(&bare, "instructions/all/team.md", "We pair on Fridays.\n");
+    assert!(kitchen_of("bare").get("empty").is_none());
+    std::fs::remove_file(dir.join("repos/notes/.kito/config.toml")).unwrap();
+
+    // The parts a repository picks are those of the kitchen it gets.
+    let (ok, said) = admin(&["kitchen", "parts", "shop", "rust"]);
+    assert!(
+        !ok && said.contains("the kitchen has no part `rust`: it has web"),
+        "{said}"
+    );
+    assert!(admin(&["kitchen", "parts", "shop", "web"]).0);
+    assert_eq!(
+        kitchen_of("shop")["concepts"],
+        json!([{ "name": "page", "about": "A page is a route", "part": "web" }])
+    );
+
+    // Whoever runs the server is told which kitchen a repository gets, and why.
+    let (ok, said) = admin(&["kitchen", "show", "shop"]);
+    assert!(
+        ok && said.contains("What `shop` gets of the kitchen Pantry: the base and web."),
+        "{said}"
+    );
+    assert!(
+        said.contains(
+            "It is the repository `pantry`, which `shop` names as its kitchen (`kito-server repo set shop \
+             --kitchen pantry`)."
+        ),
+        "{said}"
+    );
+    let (_, said) = admin(&["kitchen", "show", "notes"]);
+    assert!(
+        said.contains(
+            "It is the repository `kitchen`, the server's (`kito-server kitchen set kitchen`): `notes` names \
+             none of its own."
+        ),
+        "{said}"
+    );
+    let (_, said) = admin(&["kitchen", "show", "pantry"]);
+    assert!(
+        said.contains("`pantry` is a kitchen itself: it gets its own."),
+        "{said}"
+    );
+    let (ok, said) = admin(&["kitchen", "show"]);
+    assert!(
+        ok && said.contains("Kitchen: Shopworks (the repository `kitchen`)"),
+        "{said}"
+    );
+    assert_eq!(gets(&said, "notes"), "`kitchen` (Shopworks): the server's");
+    assert_eq!(gets(&said, "pantry"), "itself (Pantry): it is a kitchen");
+
+    // And what is wrong: a kitchen made for a repository the server does
+    // not have, a repository that names a kitchen the server does not have.
+    names(dir, "books", "../nowhere");
+    let (ok, said) = admin(&["kitchen", "check"]);
+    assert!(
+        !ok && said.contains("the kitchens have 2 problems"),
+        "{said}"
+    );
+    assert!(
+        said.contains(
+            "pantry/kitchen.toml: it is for `gone`, which is not a repository of this server"
+        ),
+        "{said}"
+    );
+    assert!(
+        said.contains(
+            "books: it names `../nowhere` as its kitchen, which is not a repository of this server"
+        ),
+        "{said}"
+    );
+    assert_eq!(gets(&said, "books"), "`kitchen` (Shopworks): the server's");
+    assert_eq!(gets(&said, "shop"), "`pantry` (Pantry): its own setting");
+    assert_eq!(
+        gets(&said, "kitchen"),
+        "itself (Shopworks): it is a kitchen"
+    );
+
+    // A repository that names one that is no kitchen is told so: it is not
+    // given another instead.
+    names(dir, "books", "../notes");
+    let none = kitchen_of("books");
+    let why = none["error"].as_str().unwrap();
+    assert!(
+        why.contains("`books` names the repository `notes` as its kitchen")
+            && why.contains("is not a kitchen: it has no kitchen.toml"),
+        "{why}"
+    );
+    let (ok, said) = admin(&["kitchen", "check"]);
+    assert!(!ok && said.contains("books: "), "{said}");
+    assert_eq!(
+        gets(&said, "books"),
+        "`notes` (not a kitchen): its own setting"
+    );
+}
+
+/// The files of a small repository: what says how it is worked on, what
+/// it tells assistants, and what is never to be read.
+fn shop_files(dir: &Path) {
+    write(
+        dir,
+        "README.md",
+        "# The shop\n\nA storefront, in TypeScript.\n",
+    );
+    let long = format!(
+        "# Contributing\n\n{}\nTHE END\n",
+        "Every change needs a test. ".repeat(200)
+    );
+    write(dir, "CONTRIBUTING.md", &long);
+    write(
+        dir,
+        "package.json",
+        r#"{ "name": "shop", "scripts": { "test": "vitest run", "lint": "eslint .", "build": "vite build" } }"#,
+    );
+    write(
+        dir,
+        "Makefile",
+        ".PHONY: all check\nall: check\ncheck:\n\tnpm run lint\n%.css: %.scss\n\tsass $< $@\n",
+    );
+    write(
+        dir,
+        ".github/workflows/ci.yml",
+        "name: CI\non: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: \
+         actions/checkout@v4\n      - name: Install\n        run: npm ci\n      - run: |\n          npm run \
+         lint\n          npm test\n      - name: Deploy\n        run: |\n          ./configure\n          make \
+         release\n          make upload\n          make announce\n",
+    );
+    write(dir, ".eslintrc.json", "{}\n");
+    write(dir, "tsconfig.json", "{}\n");
+    write(dir, "src/billing/invoice.ts", "export const total = 1;\n");
+    write(dir, "tests/invoice.test.ts", "test('total', () => {});\n");
+    // What it already tells assistants: its own instructions as Kito keeps
+    // them, and the files assistants read, with Kito's part in one.
+    write(
+        dir,
+        ".kito/instructions/all/style.md",
+        "Two spaces, never tabs.\n",
+    );
+    write(
+        dir,
+        ".kito/instructions/claude/tests.md",
+        "Run `npm test` before you say it works.\n",
+    );
+    write(dir, ".kito/instructions/all/taken-away.md", "\n");
+    write(
+        dir,
+        "CLAUDE.md",
+        "<!-- kito: begin (written by Kito) -->\n\n## Version control: Kito\n\nWork in a lane.\n\n<!-- kito: \
+         end -->\n\nPrices are in cents.\n",
+    );
+    write(
+        dir,
+        ".github/copilot-instructions.md",
+        "Prefer small functions.\n",
+    );
+    // What is never read, listed or included.
+    write(dir, ".env", "API_KEY=hunter2\n");
+    write(dir, ".env.production", "API_KEY=hunter3\n");
+    write(dir, "secrets.txt", "the vault opens with swordfish\n");
+    write(dir, "deploy.pem", "-----BEGIN PRIVATE KEY-----\n");
+    write(
+        dir,
+        "node_modules/left-pad/package.json",
+        r#"{ "name": "left-pad", "scripts": { "test": "node sneaky.js" } }"#,
+    );
+    write(dir, "target/debug/build.log", "built\n");
+    write(dir, ".git/config", "[core]\n");
+    write(
+        dir,
+        "src/secrets/keys.ts",
+        "export const key = 'opensesame';\n",
+    );
+    write(
+        dir,
+        ".kito/instructions/all/tokens.md",
+        "The token is xyzzy.\n",
+    );
+    write(dir, ".github/workflows/token-refresh.yml", "jobs: {}\n");
+    std::fs::write(dir.join("README.bin"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(dir.join("secrets.txt"), dir.join("README.link.md")).unwrap();
+        std::os::unix::fs::symlink(dir.join("node_modules"), dir.join("lib")).unwrap();
+    }
+}
+
+#[test]
+fn a_kitchen_is_drafted_from_what_the_repositories_it_is_for_say() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    for repo in ["pantry", "shop", "books"] {
+        std::fs::create_dir_all(dir.join("repos").join(repo).join(".kito")).unwrap();
+    }
+    let (pantry, shop) = (dir.join("repos/pantry"), dir.join("repos/shop"));
+    write(
+        &pantry,
+        "kitchen.toml",
+        "name = \"Pantry\"\nabout = \"How the shop is worked on.\"\nfor = [\"shop\", \"books\", \"gone\"]\n",
+    );
+    shop_files(&shop);
+    names(dir, "shop", "../pantry");
+    write(
+        &dir.join("repos/books"),
+        "README.md",
+        "# The books\n\nKept by hand, mostly.\n",
+    );
+    let draft_as = |repo: &str, role: &str| answer_as(dir, "draft", repo, role, json!({}));
+
+    // Only in a kitchen's own repository, and only for whoever maintains it.
+    let no = draft_as("shop", "maintain");
+    assert!(
+        no["error"]
+            .as_str()
+            .unwrap()
+            .contains("`shop` is not a kitchen (it has no kitchen.toml)"),
+        "{no}"
+    );
+    for role in ["read", "write", "integrate"] {
+        let no = draft_as("pantry", role);
+        assert_eq!(
+            no,
+            json!({ "error": format!("only a maintainer of `pantry` drafts its kitchen: ada may {role} there") })
+        );
+    }
+
+    let draft = draft_as("pantry", "maintain");
+    assert!(draft.get("error").is_none(), "{draft}");
+    // The interview, for the assistant to lead.
+    let how = draft["how"].as_str().unwrap();
+    assert!(
+        how.starts_with("You are about to draft this team's kitchen with the person you work for"),
+        "{how}"
+    );
+    for said in [
+        "\n1. Before you ask anything, say in two or three lines what you found",
+        "\n2. Ask the person how the team works, ONE question at a time",
+        "\n   - what the team builds, and for whom;",
+        "\n   - whether one assistant needs something the others do not.",
+        "\n3. Tools: propose only commands listed under `commands`",
+        "Never invent a command",
+        "\n4. Write everything in ONE lane of this repository. Open it with `open_lane`",
+        "about fifteen lines at most",
+        "\n5. Show the person the list of the files you wrote",
+        "`request_integration`",
+        "\n6. When the kitchen already has content (`kitchen.has`), revise it",
+    ] {
+        assert!(how.contains(said), "{said}: {how}");
+    }
+    // The kitchen as it is: nothing in it yet.
+    assert_eq!(
+        draft["kitchen"],
+        json!({
+            "name": "Pantry",
+            "about": "How the shop is worked on.",
+            "for": ["shop", "books", "gone"],
+            "has": { "behaviour": false, "concepts": [], "recipes": [], "tools": [], "instructions": [] },
+        })
+    );
+    let formats = draft["formats"].as_object().unwrap();
+    assert_eq!(
+        formats.keys().collect::<Vec<_>>(),
+        [
+            "behaviour.md",
+            "concepts/<name>.md",
+            "instructions/<assistant>/<name>.md",
+            "instructions/all/<name>.md",
+            "kitchen.toml",
+            "recipes/<name>.md",
+            "tools/<name>.toml"
+        ]
+    );
+    assert!(formats["tools/<name>.toml"]
+        .as_str()
+        .unwrap()
+        .contains("`command = \"npm\"`"));
+
+    // Of the repositories it says it is for, those that use it are read:
+    // one that does not is not, and is said as one the server does not have.
+    let read = draft["repositories"].as_array().unwrap();
+    assert_eq!(read.len(), 1, "{draft}");
+    let shop_said = &read[0];
+    assert_eq!(shop_said["name"], "shop");
+    assert_eq!(
+        draft["left_out"],
+        json!([
+            "books: not a repository of this server that uses this kitchen, so nothing of it was read",
+            "gone: not a repository of this server that uses this kitchen, so nothing of it was read",
+        ])
+    );
+
+    // The commands it has written down, each with the file that says it:
+    // none is guessed, and a long block of a workflow is a script.
+    assert_eq!(
+        shop_said["commands"],
+        json!([
+            { "name": "all", "command": "make all", "from": "Makefile" },
+            { "name": "check", "command": "make check", "from": "Makefile" },
+            { "name": "build", "command": "npm run build", "from": "package.json" },
+            { "name": "lint", "command": "npm run lint", "from": "package.json" },
+            { "name": "test", "command": "npm test", "from": "package.json" },
+            { "name": "Install", "command": "npm ci", "from": ".github/workflows/ci.yml" },
+            { "name": "ci", "command": "npm run lint", "from": ".github/workflows/ci.yml" },
+            { "name": "ci", "command": "npm test", "from": ".github/workflows/ci.yml" },
+        ])
+    );
+    // What says how it is worked on, a long one cut; of its lint and
+    // format configuration, the names.
+    let files = shop_said["files"].as_array().unwrap();
+    let listed: Vec<(&str, bool)> = files
+        .iter()
+        .map(|file| (file["path"].as_str().unwrap(), file["cut"] == true))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("README.md", false),
+            ("CONTRIBUTING.md", true),
+            ("Makefile", false),
+            ("package.json", false),
+            (".github/workflows/ci.yml", false),
+            (".eslintrc.json", false),
+            ("tsconfig.json", false),
+        ]
+    );
+    assert_eq!(
+        files[0]["text"],
+        "# The shop\n\nA storefront, in TypeScript.\n"
+    );
+    let long = files[1]["text"].as_str().unwrap();
+    assert!(
+        long.chars().count() == 4000 && long.starts_with("# Contributing\n\nEvery change"),
+        "{long}"
+    );
+    assert!(files[3]["text"].as_str().unwrap().contains("vitest run"));
+    assert_eq!(
+        (&files[5]["text"], &files[6]["text"]),
+        (&json!(""), &json!(""))
+    );
+    // What it already tells assistants, without what Kito wrote.
+    assert_eq!(
+        shop_said["instructions"],
+        json!([
+            { "name": "all/style.md", "text": "Two spaces, never tabs.\n" },
+            { "name": "claude/tests.md", "text": "Run `npm test` before you say it works.\n" },
+            { "name": "CLAUDE.md", "text": "Prices are in cents." },
+            { "name": ".github/copilot-instructions.md", "text": "Prefer small functions." },
+        ])
+    );
+    assert_eq!(
+        shop_said["layout"],
+        json!([
+            ".github/",
+            ".github/workflows/",
+            "src/",
+            "src/billing/",
+            "tests/",
+            ".eslintrc.json",
+            "CLAUDE.md",
+            "CONTRIBUTING.md",
+            "Makefile",
+            "README.md",
+            "package.json",
+            "tsconfig.json",
+        ])
+    );
+    // What is never read is nowhere in the answer: not its name, not what it holds.
+    let whole = draft.to_string();
+    for never in [
+        ".env",
+        "hunter",
+        "secret",
+        "swordfish",
+        "deploy.pem",
+        "PRIVATE KEY",
+        "node_modules",
+        "left-pad",
+        "sneaky",
+        "target/",
+        "build.log",
+        ".git/",
+        "[core]",
+        "opensesame",
+        "token",
+        "xyzzy",
+        "README.bin",
+        "README.link",
+        "lib/",
+        "THE END",
+        "Work in a lane",
+        "Kept by hand",
+    ] {
+        assert!(!whole.contains(never), "{never}: {whole}");
+    }
+
+    // A repository is read once it uses the kitchen, as the others are.
+    names(dir, "books", "../pantry");
+    let draft = draft_as("pantry", "maintain");
+    assert_eq!(draft["repositories"][1]["name"], "books");
+    assert_eq!(
+        draft["repositories"][1]["files"],
+        json!([{ "path": "README.md", "text": "# The books\n\nKept by hand, mostly.\n", "cut": false }])
+    );
+    assert_eq!(draft["repositories"][1]["commands"], json!([]));
+    assert_eq!(draft["left_out"].as_array().unwrap().len(), 1, "{draft}");
+
+    // What the kitchen already holds is said, for it to be revised.
+    write(&pantry, "behaviour.md", "Ask before you delete.\n");
+    write(
+        &pantry,
+        "concepts/order.md",
+        "# An order is what a customer paid for\n",
+    );
+    write(
+        &pantry,
+        "recipes/release.md",
+        "# How a release is made\n\n1. Tag.\n",
+    );
+    write(
+        &pantry,
+        "tools/test.toml",
+        "about = \"Runs the tests\"\ncommand = \"npm\"\nargs = [\"test\"]\n",
+    );
+    write(&pantry, "instructions/all/team.md", "We pair on Fridays.\n");
+    write(
+        &pantry,
+        "parts/web/concepts/page.md",
+        "# A page is a route\n",
+    );
+    assert_eq!(
+        draft_as("pantry", "maintain")["kitchen"]["has"],
+        json!({
+            "behaviour": true,
+            "concepts": ["order"],
+            "recipes": ["release"],
+            "tools": ["test"],
+            "instructions": ["all/team.md"],
+            "parts": ["web"],
+        })
+    );
+
+    // An answer stays under about 150 KB: files that would take it over
+    // are not added, and which are not there is said.
+    for workflow in 0..80 {
+        let text = format!("name: W{workflow}\n{}", "# a long comment\n".repeat(280));
+        write(
+            &shop,
+            &format!(".github/workflows/w{workflow:02}.yml"),
+            &text,
+        );
+    }
+    let draft = draft_as("pantry", "maintain");
+    let whole = draft.to_string();
+    assert!(whole.len() < 150_000, "{}", whole.len());
+    let given: Vec<&str> = draft["repositories"][0]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect();
+    // What says most comes first, and is there; then the workflows, as far as there was room.
+    assert_eq!(given[..2], ["README.md", "CONTRIBUTING.md"]);
+    let workflows: Vec<&str> = given
+        .iter()
+        .copied()
+        .filter(|path| path.starts_with(".github/workflows/w"))
+        .collect();
+    assert!(workflows.len() > 20, "{given:?}");
+    let first: Vec<String> = (0..workflows.len())
+        .map(|workflow| format!(".github/workflows/w{workflow:02}.yml"))
+        .collect();
+    assert_eq!(workflows, first);
+    // The others are said, one by one as far as that goes, then counted.
+    let left_out: Vec<&str> = draft["left_out"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|one| one.as_str().unwrap())
+        .collect();
+    assert_eq!(left_out.len(), 41, "{left_out:?}");
+    assert_eq!(
+        left_out[1],
+        format!("shop: .github/workflows/w{:02}.yml", workflows.len())
+    );
+    let counted: usize = left_out[40]
+        .strip_prefix("and ")
+        .and_then(|rest| rest.strip_suffix(" more"))
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("{left_out:?}"));
+    assert_eq!(workflows.len() + 39 + counted, 80, "{left_out:?}");
 }
 
 #[test]
@@ -448,6 +1068,31 @@ fn a_team_s_kitchen_reaches_whoever_works_in_a_connected_directory() {
     saved(&kitchen, "the kitchen");
     write(&shop, "shop.ts", "export const price = 1;\n");
     saved(&shop, "first version");
+    // A kitchen made for `books`, with nothing in it yet but what says so.
+    ok(&["repo", "add", "pantry"]);
+    ok(&["repo", "add", "books"]);
+    let (pantry, books) = (dir.join("repos/pantry"), dir.join("repos/books"));
+    for repo in [&pantry, &books] {
+        write(repo, ".gitignore", ".kito/\n");
+    }
+    write(
+        &pantry,
+        "kitchen.toml",
+        "name = \"Pantry\"\nabout = \"How the books are kept.\"\nfor = [\"books\"]\n",
+    );
+    saved(&pantry, "a kitchen to draft");
+    write(
+        &books,
+        "README.md",
+        "# The books\n\nWhat was sold, month by month.\n",
+    );
+    write(
+        &books,
+        "package.json",
+        r#"{ "scripts": { "test": "node --test", "close": "node close-month.js" } }"#,
+    );
+    write(&books, ".env", "LEDGER_KEY=hunter2\n");
+    saved(&books, "first version");
 
     ok(&["plugin", "add", "--path", plugin.to_str().unwrap()]);
     let enabled = ok(&["plugin", "enable", "kitchen", "--for-clients"]);
@@ -457,13 +1102,47 @@ fn a_team_s_kitchen_reaches_whoever_works_in_a_connected_directory() {
     );
     assert!(ok(&["kitchen", "set", "kitchen"]).contains("Shopworks"));
     ok(&["kitchen", "parts", "shop", "rust"]);
-    let token = ok(&["user", "add", "ada", "--repo", "shop:write"]);
-    let token = token
-        .lines()
-        .find(|line| line.starts_with("kito_"))
-        .unwrap()
-        .trim()
-        .to_owned();
+    // `books` names its kitchen in its own configuration, which is Kito's
+    // to write: the others get the server's.
+    let set = ok(&["repo", "set", "books", "--kitchen", "pantry"]);
+    assert!(
+        set.contains("its agents get the instructions of the kitchen pantry"),
+        "{set}"
+    );
+    let shown = ok(&["kitchen", "show", "books"]);
+    assert!(
+        shown.contains("What `books` gets of the kitchen Pantry: the base.")
+            && shown.contains("It is the repository `pantry`, which `books` names as its kitchen"),
+        "{shown}"
+    );
+    let checked = ok(&["kitchen", "check"]);
+    assert_eq!(
+        gets(&checked, "books"),
+        "`pantry` (Pantry): its own setting"
+    );
+    assert_eq!(
+        gets(&checked, "shop"),
+        "`kitchen` (Shopworks): the server's"
+    );
+    assert!(checked.contains("The kitchens are in order."), "{checked}");
+    let token_of = |added: String| {
+        let token = added.lines().find(|line| line.starts_with("kito_"));
+        token.unwrap().trim().to_owned()
+    };
+    // Ada works on the shop, reads the books, and maintains the pantry;
+    // Bob writes in the pantry.
+    let token = token_of(ok(&[
+        "user",
+        "add",
+        "ada",
+        "--repo",
+        "shop:write",
+        "--repo",
+        "books:read",
+        "--repo",
+        "pantry:maintain",
+    ]));
+    let bob_s = token_of(ok(&["user", "add", "bob", "--repo", "pantry:write"]));
 
     struct Serving(std::process::Child);
     impl Drop for Serving {
@@ -744,6 +1423,120 @@ fn a_team_s_kitchen_reaches_whoever_works_in_a_connected_directory() {
         "{kitchen_says}"
     );
 
+    // A repository gets the kitchen its own configuration names: for who
+    // reads the books, the pantry.
+    let connect = |config: &Path, token: &str, repo: &str, to: &Path| {
+        let to = to.to_str().unwrap();
+        let args = ["connect", &address, repo, to, "--plain", "--token", token];
+        let (connected, said) = kito(&base, config, &args, None);
+        assert!(connected, "{said}");
+    };
+    let (study, counter, bench) = (base.join("study"), base.join("counter"), base.join("bench"));
+    connect(&mine, &token, "books", &study);
+    let (shown, said) = kito(&study, &mine, &["kitchen"], None);
+    assert!(
+        shown && said.starts_with("The kitchen of Pantry for `books`\nHow the books are kept.\n"),
+        "{said}"
+    );
+
+    // In the pantry's own repository, where there is nothing yet, an agent
+    // is told when its session starts to offer to draft it.
+    connect(&mine, &token, "pantry", &counter);
+    let start = json!({ "hook_event_name": "SessionStart", "cwd": counter });
+    let (started, said) = kito(&counter, &mine, &["hook", "session-start"], Some(&start));
+    assert!(started, "{said}");
+    let context: Value =
+        serde_json::from_str(said.trim()).unwrap_or_else(|e| panic!("{e}: {said}"));
+    let context = context["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    let (_, pantry_says) = context
+        .split_once("From the plugin `kitchen`")
+        .unwrap_or_else(|| panic!("{context}"));
+    assert!(
+        pantry_says.contains("This repository, `pantry`, is the kitchen of Pantry")
+            && pantry_says.contains("It has nothing in it yet")
+            && pantry_says.contains(
+                "Offer the person to draft it together: if they want to, call the kitchen's `draft` tool \
+                 and follow what it says."
+            ),
+        "{pantry_says}"
+    );
+    assert!(!pantry_says.contains("Follow it."), "{pantry_says}");
+    // The tool gives it the interview to lead, and what the repository
+    // the pantry is for says of how it is worked on.
+    let tool_in = |dir: &Path, config: &Path, name: &str| -> Value {
+        let (ran, said) = kito(dir, config, &["kitchen", "tool", name], Some(&json!({})));
+        assert!(ran, "{said}");
+        serde_json::from_str(said.trim()).unwrap_or_else(|e| panic!("{e}: {said}"))
+    };
+    let draft = tool_in(&counter, &mine, "draft");
+    assert!(
+        draft["how"]
+            .as_str()
+            .is_some_and(|how| how.contains("ONE question at a time")),
+        "{draft}"
+    );
+    assert_eq!(
+        draft["kitchen"],
+        json!({
+            "name": "Pantry",
+            "about": "How the books are kept.",
+            "for": ["books"],
+            "has": { "behaviour": false, "concepts": [], "recipes": [], "tools": [], "instructions": [] },
+        })
+    );
+    let read = &draft["repositories"][0];
+    assert_eq!(read["name"], "books");
+    assert_eq!(
+        read["commands"],
+        json!([
+            { "name": "close", "command": "npm run close", "from": "package.json" },
+            { "name": "test", "command": "npm test", "from": "package.json" },
+        ])
+    );
+    assert_eq!(
+        read["files"][0],
+        json!({ "path": "README.md", "text": "# The books\n\nWhat was sold, month by month.\n", "cut": false })
+    );
+    let whole = draft.to_string();
+    assert!(
+        !whole.contains(".env") && !whole.contains("hunter2"),
+        "{whole}"
+    );
+    // It is asked of the server each time: no copy of it is kept.
+    let copies = counter.join(".kito/plugins/kitchen/copy");
+    assert!(copies.join("kitchen.json").is_file() && !copies.join("draft.json").exists());
+    // It is not for an agent that works in another repository, nor for
+    // somebody who does not maintain the kitchen.
+    assert!(tool("draft", json!({}))["error"]
+        .as_str()
+        .unwrap()
+        .contains("`shop` is not a kitchen"));
+    let bob = base.join("bob-config");
+    connect(&bob, &bob_s, "pantry", &bench);
+    let (added, said) = kito(
+        &bench,
+        &bob,
+        &["plugin", "add", "--path", plugin.to_str().unwrap()],
+        None,
+    );
+    assert!(added, "{said}");
+    assert_eq!(
+        tool_in(&bench, &bob, "draft")["error"],
+        "only a maintainer of `pantry` drafts its kitchen: bob may write there"
+    );
+    // Nor is their agent told to offer it when a session starts.
+    let start = json!({ "hook_event_name": "SessionStart", "cwd": bench });
+    let (started, said) = kito(&bench, &bob, &["hook", "session-start"], Some(&start));
+    assert!(started, "{said}");
+    assert!(
+        said.contains("It has nothing in it yet")
+            && said.contains("Drafting it is for a maintainer of this repository.")
+            && !said.contains("Offer the person to draft it together"),
+        "{said}"
+    );
+
     // What is integrated into the kitchen is the kitchen from then on.
     write(
         &kitchen,
@@ -780,8 +1573,11 @@ fn a_team_s_kitchen_reaches_whoever_works_in_a_connected_directory() {
     let (shown, said) = kito(&desk, &mine, &["kitchen", "concept", "order"], None);
     assert!(!shown && said.contains("the server ("), "{said}");
 
-    kito(&desk, &mine, &["daemon", "stop"], None);
-    for repo in [&kitchen, &shop] {
+    for connected in [&desk, &study, &counter] {
+        kito(connected, &mine, &["daemon", "stop"], None);
+    }
+    kito(&bench, &bob, &["daemon", "stop"], None);
+    for repo in [&kitchen, &shop, &pantry, &books] {
         kito(repo, &theirs, &["daemon", "stop"], None);
     }
 }

@@ -119,8 +119,13 @@ fn is_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= 64 && name.chars().all(fits) && !name.starts_with('-')
 }
 
-/// Where the copy of an answer is kept.
+/// Where the copy of an answer is kept. None: no copy of it is kept.
 fn copy_of(question: &str, params: &Value) -> Option<PathBuf> {
+    // A draft is what other repositories say, for an interview held with
+    // the server there: it is asked again each time.
+    if question == "draft" {
+        return None;
+    }
     let name = params["name"].as_str().map(str::to_lowercase);
     let file = match name {
         Some(name) if is_name(&name) => format!("{question}-{name}.json"),
@@ -415,6 +420,9 @@ pub fn tool(name: &str) -> Value {
             (Some(tool), Some(lane)) => run(tool, lane, &args["args"]),
             _ => Err("say which tool (`name`, as the tool `kitchen` lists them) and the `lane` you work in".to_owned()),
         },
+        // The interview to draft the kitchen by, and what it is drafted
+        // from: the server says both, and to whom.
+        "draft" => ask("draft", json!({})),
         other => Err(format!("the kitchen has no tool `{other}`")),
     };
     answered.unwrap_or_else(|why| json!({ "error": why }))
@@ -433,17 +441,38 @@ fn lines(entries: &Value) -> String {
 }
 
 /// `kito-kitchen session`: what an agent is told when a session starts,
-/// after Kito's own rules. Nothing, when there is no kitchen to tell.
+/// after Kito's own rules: the kitchen, or, in the repository of a kitchen
+/// that is still to be written, to offer to draft it. Nothing, when there
+/// is no kitchen to tell.
 pub fn session() -> String {
     let Ok(kitchen) = ask("kitchen", json!({})) else {
         return String::new();
     };
     let text = |key: &str| kitchen[key].as_str().unwrap_or_default();
-    let mut told = format!(
-        "The kitchen of {}: how the people you work for want work done on `{}`. Follow it.\n",
-        text("kitchen"),
-        text("repository")
-    );
+    let mut told = match kitchen["own"] == true && kitchen["empty"] == true {
+        // In the kitchen's own repository, with nothing in it yet: there
+        // is nothing to follow, and for whoever maintains it, somebody to
+        // write it with.
+        true => format!(
+            "This repository, `{}`, is the kitchen of {}: what every agent of the team is told to work on its \
+             repositories. It has nothing in it yet: no behaviour, no concept, no recipe, no tool, no \
+             instruction. {}\n",
+            text("repository"),
+            text("kitchen"),
+            match kitchen["drafts"] == true {
+                true => {
+                    "Offer the person to draft it together: if they want to, call the kitchen's `draft` tool \
+                     and follow what it says."
+                }
+                false => "Drafting it is for a maintainer of this repository.",
+            }
+        ),
+        false => format!(
+            "The kitchen of {}: how the people you work for want work done on `{}`. Follow it.\n",
+            text("kitchen"),
+            text("repository")
+        ),
+    };
     if !text("copy").is_empty() {
         told.push_str(&format!("{}\n", text("copy")));
     }
